@@ -429,6 +429,12 @@ static void mux_setup(struct k_work *work)
 
 	switch (gsm->state) {
 	case STATE_CONTROL_CHANNEL:
+		if (gsm->control_dev) {
+			/* Already assigned device */
+			gsm->state = STATE_PPP_CHANNEL;
+			goto resubmit;
+		}
+
 		/* Get UART device. There is one dev / DLCI */
 		gsm->control_dev = uart_mux_alloc();
 		if (gsm->control_dev == NULL) {
@@ -441,12 +447,19 @@ static void mux_setup(struct k_work *work)
 
 		ret = mux_attach(gsm->control_dev, uart, DLCI_CONTROL, gsm);
 		if (ret < 0) {
+			gsm->control_dev = NULL;
 			goto fail;
 		}
 
 		break;
 
 	case STATE_PPP_CHANNEL:
+		if (gsm->ppp_dev) {
+			/* Already assigned device */
+			gsm->state = STATE_AT_CHANNEL;
+			goto resubmit;
+		}
+
 		gsm->ppp_dev = uart_mux_alloc();
 		if (gsm->ppp_dev == NULL) {
 			LOG_DBG("Cannot get UART mux for %s channel", "PPP");
@@ -457,12 +470,19 @@ static void mux_setup(struct k_work *work)
 
 		ret = mux_attach(gsm->ppp_dev, uart, DLCI_PPP, gsm);
 		if (ret < 0) {
+			gsm->ppp_dev = NULL;
 			goto fail;
 		}
 
 		break;
 
 	case STATE_AT_CHANNEL:
+		if (gsm->at_dev) {
+			/* Already assigned device */
+			gsm->state = STATE_DONE;
+			goto resubmit;
+		}
+
 		gsm->at_dev = uart_mux_alloc();
 		if (gsm->at_dev == NULL) {
 			LOG_DBG("Cannot get UART mux for %s channel", "AT");
@@ -473,6 +493,7 @@ static void mux_setup(struct k_work *work)
 
 		ret = mux_attach(gsm->at_dev, uart, DLCI_AT, gsm);
 		if (ret < 0) {
+			gsm->at_dev = NULL;
 			goto fail;
 		}
 
@@ -505,6 +526,10 @@ static void mux_setup(struct k_work *work)
 fail:
 	gsm->state = STATE_INIT;
 	gsm->mux_enabled = false;
+	return;
+
+resubmit:
+	(void)k_delayed_work_submit(&gsm->gsm_configure_work, K_NO_WAIT);
 }
 
 static void gsm_configure(struct k_work *work)
@@ -557,6 +582,29 @@ static void gsm_configure(struct k_work *work)
 	}
 
 	gsm_finalize_connection(gsm);
+}
+
+void gsm_ppp_start(struct device *device)
+{
+	struct gsm_modem *gsm = device->driver_data;
+	k_delayed_work_init(&gsm->gsm_configure_work, gsm_configure);
+	(void)k_delayed_work_submit(&gsm->gsm_configure_work, K_NO_WAIT);
+}
+
+void gsm_ppp_stop(struct device *device)
+{
+	// FIXME: synchronize with gsm_rx... mutex?
+
+	/* Stop PPP */
+	struct device *ppp_dev = device_get_binding(CONFIG_NET_PPP_DRV_NAME);
+	const struct ppp_api *api;
+
+	if (!ppp_dev) {
+		LOG_ERR("Cannot find PPP %s!", "device");
+	} else {
+		api = (const struct ppp_api *)ppp_dev->driver_api;
+		api->stop(ppp_dev);
+	}
 }
 
 static int gsm_init(struct device *device)
@@ -620,9 +668,7 @@ static int gsm_init(struct device *device)
 			gsm, NULL, NULL, K_PRIO_COOP(7), 0, K_NO_WAIT);
 	k_thread_name_set(&gsm_rx_thread, "gsm_rx");
 
-	k_delayed_work_init(&gsm->gsm_configure_work, gsm_configure);
-
-	(void)k_delayed_work_submit(&gsm->gsm_configure_work, K_NO_WAIT);
+	gsm_ppp_start(device);
 
 	return 0;
 }
